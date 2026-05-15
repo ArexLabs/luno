@@ -1,0 +1,5 @@
+fn main() {
+    let x = "hello"
+    let y = x
+    print(x)
+}

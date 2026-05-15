@@ -1,888 +1,787 @@
-// --- parser.rs — Luno Parser ---
-// Builds a typed AST from a Vec<Token>.
-// Uses recursive-descent parsing.
-
-use crate::lexer::{StringPart, Token};
-
-// --- AST Node Types ---
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum Expr {
-    Int(i64),
-    Float(f64),
-    Str(String),
-    InterpolatedStr(Vec<StringPartExpr>),
-    Bool(bool),
-    Null,
-    Identifier(String),
-    SelfRef,
-
-    // Operations
-    BinaryOp {
-        left: Box<Expr>,
-        op: BinOp,
-        right: Box<Expr>,
-    },
-    UnaryOp {
-        op: UnaryOp,
-        operand: Box<Expr>,
-    },
-    Comparison {
-        left: Box<Expr>,
-        op: CmpOp,
-        right: Box<Expr>,
-    },
-    Logical {
-        left: Box<Expr>,
-        op: LogicOp,
-        right: Box<Expr>,
-    },
-
-    // Access
-    Call {
-        callee: Box<Expr>,
-        args: Vec<Expr>,
-    },
-    Index {
-        object: Box<Expr>,
-        index: Box<Expr>,
-    },
-    Attribute {
-        object: Box<Expr>,
-        name: String,
-    },
-
-    // Constructors
-    ListLiteral(Vec<Expr>),
-    MapLiteral(Vec<(Expr, Expr)>),
-    SetLiteral(Vec<Expr>),
-
-    // Lambda
-    Lambda {
-        params: Vec<Param>,
-        body: Box<Expr>,
-    },
-
-    // Assignment expression (for things like self.x = ...)
-    Assign {
-        target: Box<Expr>,
-        value: Box<Expr>,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub enum StringPartExpr {
-    Literal(String),
-    Expr(Expr),
-}
-
-#[derive(Debug, Clone)]
-pub enum BinOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Pow,
-}
-
-#[derive(Debug, Clone)]
-pub enum UnaryOp {
-    Neg,
-    Not,
-}
-
-#[derive(Debug, Clone)]
-pub enum CmpOp {
-    Eq,
-    NotEq,
-    Lt,
-    Gt,
-    LtEq,
-    GtEq,
-}
-
-#[derive(Debug, Clone)]
-pub enum LogicOp {
-    And,
-    Or,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Param {
-    pub name: String,
-    pub type_hint: Option<String>,
-    pub default: Option<Expr>,
-    pub variadic: bool,
-}
-
-// --- Statements ---
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum Stmt {
-    // Variable declarations
-    Let {
-        name: String,
-        type_hint: Option<String>,
-        value: Expr,
-    },
-    Const {
-        name: String,
-        type_hint: Option<String>,
-        value: Expr,
-    },
-
-    // Assignment
-    Assign {
-        target: Expr,
-        value: Expr,
-    },
-    AugAssign {
-        target: Expr,
-        op: BinOp,
-        value: Expr,
-    },
-
-    // Expression statement
-    ExprStmt(Expr),
-
-    // Function definition
-    FnDef {
-        name: String,
-        params: Vec<Param>,
-        return_type: Option<String>,
-        body: Vec<Stmt>,
-    },
-
-    // Return
-    Return(Option<Expr>),
-
-    // Control flow
-    If {
-        condition: Expr,
-        body: Vec<Stmt>,
-        elif_branches: Vec<(Expr, Vec<Stmt>)>,
-        else_body: Option<Vec<Stmt>>,
-    },
-    While {
-        condition: Expr,
-        body: Vec<Stmt>,
-    },
-    For {
-        var: String,
-        iterable: Expr,
-        body: Vec<Stmt>,
-    },
-    Break,
-    Continue,
-
-    // Match
-    Match {
-        value: Expr,
-        cases: Vec<(Expr, Vec<Stmt>)>,
-    },
-
-    // Class
-    ClassDef {
-        name: String,
-        parent: Option<String>,
-        body: Vec<Stmt>,
-    },
-
-    // Import
-    Import {
-        module: String,
-    },
-    FromImport {
-        module: String,
-        names: Vec<String>,
-    },
-
-    // Error handling
-    TryCatch {
-        try_body: Vec<Stmt>,
-        catches: Vec<CatchClause>,
-        finally_body: Option<Vec<Stmt>>,
-    },
-    Raise(Expr),
-    ErrorDef {
-        name: String,
-        message: Expr,
-    },
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct CatchClause {
-    pub error_type: Option<String>,
-    pub var_name: Option<String>,
-    pub body: Vec<Stmt>,
-}
-
-// --- Parser ---
+use crate::ast::*;
+use crate::error::{Span, Diag, Diagnostics};
+use crate::lexer::{Token, TokenKind};
 
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    diags: Diagnostics,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser { tokens, pos: 0, diags: Diagnostics::new() }
     }
-
-    // --- Entry point ---
-    pub fn parse(&mut self) -> Result<Vec<Stmt>, String> {
-        let mut stmts = Vec::new();
-
-        // Skip leading newlines
-        self.skip_newlines();
-
-        while !self.is_at_end() {
-            stmts.push(self.parse_statement()?);
-            self.skip_newlines();
-        }
-
-        Ok(stmts)
-    }
-
-    // --- Helpers ---
 
     fn current(&self) -> &Token {
         &self.tokens[self.pos]
     }
 
-    #[allow(dead_code)]
-    fn peek(&self) -> &Token {
-        if self.pos + 1 < self.tokens.len() {
-            &self.tokens[self.pos + 1]
-        } else {
-            &Token::Eof
-        }
+    fn kind(&self) -> &TokenKind {
+        &self.current().kind
+    }
+
+    fn span(&self) -> Span {
+        self.current().span.clone()
+    }
+
+    fn at_end(&self) -> bool {
+        matches!(self.kind(), TokenKind::Eof)
     }
 
     fn advance(&mut self) -> Token {
         let tok = self.tokens[self.pos].clone();
-        self.pos += 1;
+        if self.pos < self.tokens.len() {
+            self.pos += 1;
+        }
         tok
     }
 
-    fn expect(&mut self, expected: &Token) -> Result<Token, String> {
-        if self.current() == expected {
+    fn expect(&mut self, kind: &TokenKind) -> std::result::Result<Token, Diagnostics> {
+        if self.kind() == kind {
             Ok(self.advance())
         } else {
-            Err(format!(
-                "Expected {:?}, found {:?} at token position {}",
-                expected,
-                self.current(),
-                self.pos
-            ))
+            let msg = format!("expected {:?}, found {:?}", kind, self.kind());
+            self.diags.push(Diag::error(msg, self.span()));
+            Err(std::mem::take(&mut self.diags))
         }
     }
 
-    fn is_at_end(&self) -> bool {
-        self.pos >= self.tokens.len() || self.current() == &Token::Eof
+    fn expect_ident(&mut self) -> std::result::Result<String, Diagnostics> {
+        match self.kind() {
+            TokenKind::Ident(s) => {
+                let s = s.clone();
+                self.advance();
+                Ok(s)
+            }
+            _ => {
+                let msg = format!("expected identifier, found {:?}", self.kind());
+                self.diags.push(Diag::error(msg, self.span()));
+                Err(std::mem::take(&mut self.diags))
+            }
+        }
     }
 
     fn skip_newlines(&mut self) {
-        while !self.is_at_end() && self.current() == &Token::Newline {
+        while matches!(self.kind(), TokenKind::Newline) {
             self.advance();
+        }
+    }
+
+    // --- Entry point ---
+
+    pub fn parse(&mut self) -> std::result::Result<Program, Diagnostics> {
+        let mut stmts = Vec::new();
+        self.skip_newlines();
+
+        while !self.at_end() {
+            match self.parse_stmt() {
+                Ok(s) => stmts.push(s),
+                Err(_) => {
+                    if self.diags.has_errors() {
+                        break;
+                    }
+                    if !self.at_end() {
+                        self.advance();
+                    }
+                }
+            }
+            self.skip_newlines();
+        }
+
+        if self.diags.has_errors() {
+            Err(std::mem::take(&mut self.diags))
+        } else {
+            Ok(Program { stmts })
         }
     }
 
     // --- Statement parsing ---
 
-    fn parse_statement(&mut self) -> Result<Stmt, String> {
-        match self.current() {
-            Token::Let => self.parse_let(),
-            Token::Const => self.parse_const(),
-            Token::Fn => self.parse_fn_def(),
-            Token::Return => self.parse_return(),
-            Token::If => self.parse_if(),
-            Token::While => self.parse_while(),
-            Token::For => self.parse_for(),
-            Token::Break => {
+    fn parse_stmt(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        match self.kind() {
+            TokenKind::Let => self.parse_let(),
+            TokenKind::Const => self.parse_const(),
+            TokenKind::Fn => self.parse_fn_def(),
+            TokenKind::Return => self.parse_return(),
+            TokenKind::If => self.parse_if(),
+            TokenKind::For => self.parse_for(),
+            TokenKind::While => self.parse_while(),
+            TokenKind::Break => {
+                let s = self.span();
                 self.advance();
-                Ok(Stmt::Break)
+                Ok(Stmt::Break(s))
             }
-            Token::Continue => {
+            TokenKind::Continue => {
+                let s = self.span();
                 self.advance();
-                Ok(Stmt::Continue)
+                Ok(Stmt::Continue(s))
             }
-            Token::Match => self.parse_match(),
-            Token::Class => self.parse_class(),
-            Token::Import => self.parse_import(),
-            Token::From => self.parse_from_import(),
-            Token::Try => self.parse_try(),
-            Token::Raise => self.parse_raise(),
-            Token::ErrorKw => self.parse_error_def(),
-            _ => self.parse_assignment_or_expr(),
+            TokenKind::Match => self.parse_match(),
+            TokenKind::Type => self.parse_type_def(),
+            TokenKind::Enum => self.parse_enum_def(),
+            TokenKind::Trait => self.parse_trait_def(),
+            TokenKind::Impl => self.parse_impl(),
+            TokenKind::Import => self.parse_import(),
+            TokenKind::From => self.parse_from_import(),
+            TokenKind::LBrace => {
+                let s = self.span();
+                let body = self.parse_block()?;
+                Ok(Stmt::Expr(Expr::Block(body, s)))
+            }
+            _ => self.parse_expr_stmt(),
         }
     }
 
-    // --- let name [: type] = value ---
-    fn parse_let(&mut self) -> Result<Stmt, String> {
+    // --- Let: name := value or name: Type = value ---
+
+    fn parse_let(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
         self.advance(); // skip 'let'
-        let name = self.expect_identifier()?;
-        let type_hint = if self.current() == &Token::Colon {
-            self.advance();
-            Some(self.expect_identifier()?)
-        } else {
-            None
-        };
-        self.expect(&Token::Assign)?;
-        let value = self.parse_expression()?;
-        Ok(Stmt::Let {
-            name,
-            type_hint,
-            value,
-        })
+        let name = self.expect_ident()?;
+        let _mutable = true;
+        let mut type_hint = None;
+        let value;
+
+        match self.kind() {
+            TokenKind::ColonEq => {
+                self.advance();
+                value = self.parse_expr()?;
+            }
+            TokenKind::Colon => {
+                self.advance();
+                type_hint = Some(self.parse_type_expr()?);
+                self.expect(&TokenKind::Assign)?;
+                value = self.parse_expr()?;
+            }
+            TokenKind::Assign => {
+                self.advance();
+                value = self.parse_expr()?;
+            }
+            _ => {
+                self.diags.push(Diag::error("expected ':=' or ': Type ='", self.span()));
+                return Err(std::mem::take(&mut self.diags));
+            }
+        }
+
+        Ok(Stmt::Let { name, type_hint, value, mutable: _mutable, span: s })
     }
 
-    // --- const name [: type] = value ---
-    fn parse_const(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'const'
-        let name = self.expect_identifier()?;
-        let type_hint = if self.current() == &Token::Colon {
-            self.advance();
-            Some(self.expect_identifier()?)
-        } else {
-            None
-        };
-        self.expect(&Token::Assign)?;
-        let value = self.parse_expression()?;
-        Ok(Stmt::Const {
-            name,
-            type_hint,
-            value,
-        })
+    // --- Const: const name = value ---
+
+    fn parse_const(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::Assign)?;
+        let value = self.parse_expr()?;
+        Ok(Stmt::Const { name, value, span: s })
     }
 
-    // --- fn name(params) [-> type]: body ---
-    fn parse_fn_def(&mut self) -> Result<Stmt, String> {
+    // --- Function: fn name(params) -> Type { body } ---
+
+    fn parse_fn_def(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
         self.advance(); // skip 'fn'
-        let name = self.expect_identifier()?;
-        self.expect(&Token::LeftParen)?;
+        let name = self.expect_ident()?;
+        let _generics = self.parse_generic_params()?;
+        self.expect(&TokenKind::LParen)?;
         let params = self.parse_params()?;
-        self.expect(&Token::RightParen)?;
+        self.expect(&TokenKind::RParen)?;
 
-        let return_type = if self.current() == &Token::Arrow {
+        let return_type = if matches!(self.kind(), TokenKind::Arrow) {
             self.advance();
-            Some(self.expect_identifier()?)
+            Some(self.parse_type_expr()?)
         } else {
             None
         };
 
-        self.expect(&Token::Colon)?;
         let body = self.parse_block()?;
-        Ok(Stmt::FnDef {
-            name,
-            params,
-            return_type,
-            body,
-        })
+
+        Ok(Stmt::FnDef { name, params, return_type, body, span: s })
     }
 
-    // --- Parse parameter list ---
-    fn parse_params(&mut self) -> Result<Vec<Param>, String> {
+    fn parse_generic_params(&mut self) -> std::result::Result<Vec<String>, Diagnostics> {
+        if matches!(self.kind(), TokenKind::LBrack) {
+            self.advance(); // skip [
+            let mut params = Vec::new();
+            params.push(self.expect_ident()?);
+            while matches!(self.kind(), TokenKind::Comma) {
+                self.advance();
+                params.push(self.expect_ident()?);
+            }
+            self.expect(&TokenKind::RBrack)?;
+            Ok(params)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    fn parse_params(&mut self) -> std::result::Result<Vec<Param>, Diagnostics> {
         let mut params = Vec::new();
-        if self.current() == &Token::RightParen {
+        if matches!(self.kind(), TokenKind::RParen) {
             return Ok(params);
         }
 
         loop {
-            let variadic = if self.current() == &Token::Star {
+            let s = self.span();
+            let name = self.expect_ident()?;
+            let type_hint = if matches!(self.kind(), TokenKind::Colon) {
                 self.advance();
-                true
-            } else {
-                false
-            };
-
-            let name = if self.current() == &Token::Self_ {
-                self.advance();
-                "self".to_string()
-            } else {
-                self.expect_identifier()?
-            };
-
-            let type_hint = if self.current() == &Token::Colon {
-                self.advance();
-                Some(self.expect_identifier()?)
+                Some(self.parse_type_expr()?)
             } else {
                 None
             };
-
-            let default = if self.current() == &Token::Assign {
+            let default = if matches!(self.kind(), TokenKind::Assign) {
                 self.advance();
-                Some(self.parse_expression()?)
+                Some(self.parse_expr()?)
             } else {
                 None
             };
+            params.push(Param { name, type_hint, default, span: s });
 
-            params.push(Param {
-                name,
-                type_hint,
-                default,
-                variadic,
-            });
-
-            if self.current() != &Token::Comma {
+            if matches!(self.kind(), TokenKind::Comma) {
+                self.advance();
+            } else {
                 break;
             }
-            self.advance(); // skip comma
         }
-
         Ok(params)
     }
 
-    // --- return [expr] ---
-    fn parse_return(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'return'
-        if self.current() == &Token::Newline
-            || self.current() == &Token::Eof
-            || self.current() == &Token::Dedent
-        {
-            Ok(Stmt::Return(None))
+    fn parse_block(&mut self) -> std::result::Result<Vec<Stmt>, Diagnostics> {
+        self.expect(&TokenKind::LBrace)?;
+        self.skip_newlines();
+        let mut stmts = Vec::new();
+        while !matches!(self.kind(), TokenKind::RBrace) && !self.at_end() {
+            stmts.push(self.parse_stmt()?);
+            self.skip_newlines();
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(stmts)
+    }
+
+    // --- Return ---
+
+    fn parse_return(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        if matches!(self.kind(), TokenKind::Newline | TokenKind::RBrace | TokenKind::Eof) {
+            Ok(Stmt::Return(None, s))
         } else {
-            let expr = self.parse_expression()?;
-            Ok(Stmt::Return(Some(expr)))
+            let expr = self.parse_expr()?;
+            Ok(Stmt::Return(Some(expr), s))
         }
     }
 
-    // --- if/elif/else ---
-    fn parse_if(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'if'
-        let condition = self.parse_expression()?;
-        self.expect(&Token::Colon)?;
+    // --- If / Elif / Else ---
+
+    fn parse_if(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let cond = self.parse_expr()?;
         let body = self.parse_block()?;
 
-        let mut elif_branches = Vec::new();
+        let mut elifs = Vec::new();
         let mut else_body = None;
 
         self.skip_newlines();
-        while self.current() == &Token::Elif {
+        while matches!(self.kind(), TokenKind::Elif) {
             self.advance();
-            let elif_cond = self.parse_expression()?;
-            self.expect(&Token::Colon)?;
+            let elif_cond = self.parse_expr()?;
             let elif_body = self.parse_block()?;
-            elif_branches.push((elif_cond, elif_body));
+            elifs.push((elif_cond, elif_body));
             self.skip_newlines();
         }
 
-        if self.current() == &Token::Else {
+        if matches!(self.kind(), TokenKind::Else) {
             self.advance();
-            self.expect(&Token::Colon)?;
             else_body = Some(self.parse_block()?);
         }
 
-        Ok(Stmt::If {
-            condition,
-            body,
-            elif_branches,
-            else_body,
-        })
+        Ok(Stmt::Expr(Expr::If(Box::new(cond), body, elifs, else_body, s)))
     }
 
-    // --- while condition: ---
-    fn parse_while(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'while'
-        let condition = self.parse_expression()?;
-        self.expect(&Token::Colon)?;
+    // --- For loop ---
+
+    fn parse_for(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let var = self.expect_ident()?;
+        self.expect(&TokenKind::In)?;
+        let iterable = self.parse_expr()?;
         let body = self.parse_block()?;
-        Ok(Stmt::While { condition, body })
+        Ok(Stmt::Expr(Expr::ForLoop(var, Box::new(iterable), body, s)))
     }
 
-    // --- for var in iterable: ---
-    fn parse_for(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'for'
-        let var = self.expect_identifier()?;
-        self.expect(&Token::In)?;
-        let iterable = self.parse_expression()?;
-        self.expect(&Token::Colon)?;
+    // --- While loop ---
+
+    fn parse_while(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let cond = self.parse_expr()?;
         let body = self.parse_block()?;
-        Ok(Stmt::For {
-            var,
-            iterable,
-            body,
-        })
+        Ok(Stmt::Expr(Expr::WhileLoop(Box::new(cond), body, s)))
     }
 
-    // --- match value: case ...: ---
-    fn parse_match(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'match'
-        let value = self.parse_expression()?;
-        self.expect(&Token::Colon)?;
-        self.skip_newlines();
-        self.expect(&Token::Indent)?;
+    // --- Match ---
 
-        let mut cases = Vec::new();
+    fn parse_match(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let value = self.parse_expr()?;
+        self.expect(&TokenKind::LBrace)?;
         self.skip_newlines();
 
-        while self.current() == &Token::Case {
+        let mut arms = Vec::new();
+        while matches!(self.kind(), TokenKind::Case) {
             self.advance();
-            let pattern = self.parse_expression()?;
-            self.expect(&Token::Colon)?;
-            let body = self.parse_block()?;
-            cases.push((pattern, body));
+            let pattern = self.parse_pattern()?;
+            self.expect(&TokenKind::FatArrow)?;
+            let body = if matches!(self.kind(), TokenKind::LBrace) {
+                self.parse_block()?
+            } else {
+                let expr = self.parse_expr()?;
+                vec![Stmt::Expr(expr)]
+            };
+            arms.push((pattern, body));
             self.skip_newlines();
         }
 
-        self.expect(&Token::Dedent)?;
-        Ok(Stmt::Match { value, cases })
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Stmt::Expr(Expr::Match(Box::new(value), arms, s)))
     }
 
-    // --- class Name[(Parent)]: ---
-    fn parse_class(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'class'
-        let name = self.expect_identifier()?;
+    // --- Pattern ---
 
-        let parent = if self.current() == &Token::LeftParen {
+    fn parse_pattern(&mut self) -> std::result::Result<Pattern, Diagnostics> {
+        let s = self.span();
+        match self.kind() {
+            TokenKind::Underscore => {
+                self.advance();
+                Ok(Pattern::Wildcard(s))
+            }
+            TokenKind::Int(n) => {
+                let n = *n;
+                self.advance();
+                Ok(Pattern::Literal(Literal::Int(n), s))
+            }
+            TokenKind::Str(sval) => {
+                let sval = sval.clone();
+                self.advance();
+                Ok(Pattern::Literal(Literal::String(sval), s))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Pattern::Literal(Literal::Bool(true), s))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Pattern::Literal(Literal::Bool(false), s))
+            }
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+                // Check if it's a variant pattern (PascalCase)
+                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    if matches!(self.kind(), TokenKind::LParen) {
+                        self.advance();
+                        let mut patterns = Vec::new();
+                        if !matches!(self.kind(), TokenKind::RParen) {
+                            loop {
+                                patterns.push(self.parse_pattern()?);
+                                if matches!(self.kind(), TokenKind::Comma) {
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                        Ok(Pattern::Variant(name, patterns, s))
+                    } else {
+                        Ok(Pattern::Variant(name, vec![], s))
+                    }
+                } else {
+                    Ok(Pattern::Binding(name, s))
+                }
+            }
+            _ => {
+                let msg = format!("expected pattern, found {:?}", self.kind());
+                self.diags.push(Diag::error(msg, s));
+                Err(std::mem::take(&mut self.diags))
+            }
+        }
+    }
+
+    // --- Type definition: type Name { fields } ---
+
+    fn parse_type_def(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let name = self.expect_ident()?;
+        let generics = self.parse_generic_params()?;
+        self.expect(&TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        let mut fields = Vec::new();
+        while !matches!(self.kind(), TokenKind::RBrace) && !self.at_end() {
+            let fs = self.span();
+            let fname = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ftype = self.parse_type_expr()?;
+            fields.push(Field { name: fname, type_expr: ftype, span: fs });
+            self.skip_newlines();
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        Ok(Stmt::TypeDef { name, generics, fields, span: s })
+    }
+
+    // --- Enum: enum Name { Variant, Variant(Type), ... } ---
+
+    fn parse_enum_def(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let name = self.expect_ident()?;
+        let generics = self.parse_generic_params()?;
+        self.expect(&TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        let mut variants = Vec::new();
+        while !matches!(self.kind(), TokenKind::RBrace) && !self.at_end() {
+            let vs = self.span();
+            let vname = self.expect_ident()?;
+            let mut types = Vec::new();
+            if matches!(self.kind(), TokenKind::LParen) {
+                self.advance();
+                if !matches!(self.kind(), TokenKind::RParen) {
+                    loop {
+                        types.push(self.parse_type_expr()?);
+                        if matches!(self.kind(), TokenKind::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+            }
+            variants.push(Variant { name: vname, types, span: vs });
+            self.skip_newlines();
+            if matches!(self.kind(), TokenKind::Comma) {
+                self.advance();
+                self.skip_newlines();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        Ok(Stmt::EnumDef { name, generics, variants, span: s })
+    }
+
+    // --- Trait: trait Name { fn sig(); ... } ---
+
+    fn parse_trait_def(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let name = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        self.skip_newlines();
+
+        let mut methods = Vec::new();
+        while !matches!(self.kind(), TokenKind::RBrace) && !self.at_end() {
+            let ms = self.span();
+            self.expect(&TokenKind::Fn)?;
+            let mname = self.expect_ident()?;
+            self.expect(&TokenKind::LParen)?;
+            let params = self.parse_params()?;
+            self.expect(&TokenKind::RParen)?;
+            let return_type = if matches!(self.kind(), TokenKind::Arrow) {
+                self.advance();
+                Some(self.parse_type_expr()?)
+            } else {
+                None
+            };
+            methods.push(TraitMethod { name: mname, params, return_type, span: ms });
+            if matches!(self.kind(), TokenKind::Semicolon) {
+                self.advance();
+            }
+            self.skip_newlines();
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        Ok(Stmt::TraitDef { name, methods, span: s })
+    }
+
+    // --- Impl: impl Type { methods } or impl Trait for Type { methods } ---
+
+    fn parse_impl(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+
+        let name = self.expect_ident()?;
+
+        if matches!(self.kind(), TokenKind::For) {
             self.advance();
-            let p = self.expect_identifier()?;
-            self.expect(&Token::RightParen)?;
-            Some(p)
+            let type_name = self.expect_ident()?;
+            let body = self.parse_block()?;
+            let methods = self.filter_methods(body);
+            Ok(Stmt::ImplTrait { trait_name: name, type_name, methods, span: s })
         } else {
-            None
-        };
-
-        self.expect(&Token::Colon)?;
-        let body = self.parse_block()?;
-
-        Ok(Stmt::ClassDef { name, parent, body })
-    }
-
-    // --- import module ---
-    fn parse_import(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'import'
-        let module = self.expect_identifier()?;
-        Ok(Stmt::Import { module })
-    }
-
-    // --- from module import name1, name2 ---
-    fn parse_from_import(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'from'
-        let module = self.expect_identifier()?;
-        self.expect(&Token::Import)?;
-        let mut names = Vec::new();
-        names.push(self.expect_identifier()?);
-        while self.current() == &Token::Comma {
-            self.advance();
-            names.push(self.expect_identifier()?);
-        }
-        Ok(Stmt::FromImport { module, names })
-    }
-
-    // --- try/catch/finally ---
-    fn parse_try(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'try'
-        self.expect(&Token::Colon)?;
-        let try_body = self.parse_block()?;
-
-        let mut catches = Vec::new();
-        let mut finally_body = None;
-
-        self.skip_newlines();
-        while self.current() == &Token::Catch {
-            self.advance();
-            let error_type = if self.current() != &Token::Colon && self.current() != &Token::As {
-                Some(self.expect_identifier()?)
-            } else {
-                None
-            };
-            let var_name = if self.current() == &Token::As {
-                self.advance();
-                Some(self.expect_identifier()?)
-            } else {
-                None
-            };
-            self.expect(&Token::Colon)?;
             let body = self.parse_block()?;
-            catches.push(CatchClause {
-                error_type,
-                var_name,
-                body,
-            });
-            self.skip_newlines();
+            let methods = self.filter_methods(body);
+            Ok(Stmt::ImplBlock { type_name: name, methods, span: s })
         }
+    }
 
-        if self.current() == &Token::Finally {
+    fn filter_methods(&self, stmts: Vec<Stmt>) -> Vec<Stmt> {
+        stmts.into_iter().filter(|s| matches!(s, Stmt::FnDef { .. })).collect()
+    }
+
+    // --- Import ---
+
+    fn parse_import(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let module = self.expect_ident()?;
+        Ok(Stmt::Import { module, span: s })
+    }
+
+    fn parse_from_import(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let s = self.span();
+        self.advance();
+        let module = self.expect_ident()?;
+        self.expect(&TokenKind::Import)?;
+        let mut names = Vec::new();
+        names.push(self.expect_ident()?);
+        while matches!(self.kind(), TokenKind::Comma) {
             self.advance();
-            self.expect(&Token::Colon)?;
-            finally_body = Some(self.parse_block()?);
+            names.push(self.expect_ident()?);
         }
-
-        Ok(Stmt::TryCatch {
-            try_body,
-            catches,
-            finally_body,
-        })
+        Ok(Stmt::FromImport { module, names, span: s })
     }
 
-    // --- raise expr ---
-    fn parse_raise(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'raise'
-        let expr = self.parse_expression()?;
-        Ok(Stmt::Raise(expr))
-    }
+    // --- Expression statement ---
 
-    // --- error Name: "message" ---
-    fn parse_error_def(&mut self) -> Result<Stmt, String> {
-        self.advance(); // skip 'error'
-        let name = self.expect_identifier()?;
-        self.expect(&Token::Colon)?;
-        let message = self.parse_expression()?;
-        Ok(Stmt::ErrorDef { name, message })
-    }
+    fn parse_expr_stmt(&mut self) -> std::result::Result<Stmt, Diagnostics> {
+        let expr = self.parse_expr()?;
 
-    // --- Assignment or expression statement ---
-    fn parse_assignment_or_expr(&mut self) -> Result<Stmt, String> {
-        let expr = self.parse_expression()?;
-
-        match self.current() {
-            Token::Assign => {
+        match self.kind() {
+            TokenKind::Assign => {
+                let s = self.span();
                 self.advance();
-                let value = self.parse_expression()?;
+                let value = self.parse_expr()?;
+                Ok(Stmt::Assign { target: expr, value, span: s })
+            }
+            TokenKind::PlusEq | TokenKind::MinusEq | TokenKind::StarEq | TokenKind::SlashEq => {
+                let _op = match self.kind() {
+                    TokenKind::PlusEq => AssignOp::AddEq,
+                    TokenKind::MinusEq => AssignOp::SubEq,
+                    TokenKind::StarEq => AssignOp::MulEq,
+                    TokenKind::SlashEq => AssignOp::DivEq,
+                    _ => unreachable!(),
+                };
+                let s = self.span();
+                self.advance();
+                let value = self.parse_expr()?;
                 Ok(Stmt::Assign {
-                    target: expr,
-                    value,
+                    target: expr.clone(),
+                    value: Expr::BinOp(Box::new(expr), BinOp::Add, Box::new(value), s.clone()),
+                    span: s,
                 })
             }
-            Token::PlusAssign => {
-                self.advance();
-                let value = self.parse_expression()?;
-                Ok(Stmt::AugAssign {
-                    target: expr,
-                    op: BinOp::Add,
-                    value,
-                })
-            }
-            Token::MinusAssign => {
-                self.advance();
-                let value = self.parse_expression()?;
-                Ok(Stmt::AugAssign {
-                    target: expr,
-                    op: BinOp::Sub,
-                    value,
-                })
-            }
-            Token::StarAssign => {
-                self.advance();
-                let value = self.parse_expression()?;
-                Ok(Stmt::AugAssign {
-                    target: expr,
-                    op: BinOp::Mul,
-                    value,
-                })
-            }
-            Token::SlashAssign => {
-                self.advance();
-                let value = self.parse_expression()?;
-                Ok(Stmt::AugAssign {
-                    target: expr,
-                    op: BinOp::Div,
-                    value,
-                })
-            }
-            _ => Ok(Stmt::ExprStmt(expr)),
+            _ => Ok(Stmt::Expr(expr)),
         }
     }
 
-    // --- Expression parsing (precedence climbing) ---
+    // --- Expression parsing ---
 
-    fn parse_expression(&mut self) -> Result<Expr, String> {
-        // Lambda
-        if self.current() == &Token::Lam {
-            return self.parse_lambda();
-        }
+    fn parse_expr(&mut self) -> std::result::Result<Expr, Diagnostics> {
         self.parse_or()
     }
 
-    fn parse_lambda(&mut self) -> Result<Expr, String> {
-        self.advance(); // skip 'lam'
-        let mut params = Vec::new();
-
-        // Parse params until =>
-        while self.current() != &Token::FatArrow {
-            if !params.is_empty() {
-                self.expect(&Token::Comma)?;
-            }
-            let name = self.expect_identifier()?;
-            params.push(Param {
-                name,
-                type_hint: None,
-                default: None,
-                variadic: false,
-            });
-        }
-        self.expect(&Token::FatArrow)?;
-        let body = self.parse_expression()?;
-        Ok(Expr::Lambda {
-            params,
-            body: Box::new(body),
-        })
-    }
-
-    fn parse_or(&mut self) -> Result<Expr, String> {
+    fn parse_or(&mut self) -> std::result::Result<Expr, Diagnostics> {
         let mut left = self.parse_and()?;
-        while self.current() == &Token::Or {
+        while matches!(self.kind(), TokenKind::OrOr) {
+            let s = self.span();
             self.advance();
             let right = self.parse_and()?;
-            left = Expr::Logical {
-                left: Box::new(left),
-                op: LogicOp::Or,
-                right: Box::new(right),
-            };
+            left = Expr::Logical(Box::new(left), BinOp::Or, Box::new(right), s);
         }
         Ok(left)
     }
 
-    fn parse_and(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_not()?;
-        while self.current() == &Token::And {
+    fn parse_and(&mut self) -> std::result::Result<Expr, Diagnostics> {
+        let mut left = self.parse_cmp()?;
+        while matches!(self.kind(), TokenKind::AndAnd) {
+            let s = self.span();
             self.advance();
-            let right = self.parse_not()?;
-            left = Expr::Logical {
-                left: Box::new(left),
-                op: LogicOp::And,
-                right: Box::new(right),
-            };
+            let right = self.parse_cmp()?;
+            left = Expr::Logical(Box::new(left), BinOp::And, Box::new(right), s);
         }
         Ok(left)
     }
 
-    fn parse_not(&mut self) -> Result<Expr, String> {
-        if self.current() == &Token::Not {
-            self.advance();
-            let operand = self.parse_not()?;
-            return Ok(Expr::UnaryOp {
-                op: UnaryOp::Not,
-                operand: Box::new(operand),
-            });
-        }
-        self.parse_comparison()
-    }
+    fn parse_cmp(&mut self) -> std::result::Result<Expr, Diagnostics> {
+        let left = self.parse_add()?;
 
-    fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let left = self.parse_addition()?;
-
-        let op = match self.current() {
-            Token::Eq => CmpOp::Eq,
-            Token::NotEq => CmpOp::NotEq,
-            Token::Lt => CmpOp::Lt,
-            Token::Gt => CmpOp::Gt,
-            Token::LtEq => CmpOp::LtEq,
-            Token::GtEq => CmpOp::GtEq,
+        let op = match self.kind() {
+            TokenKind::Eq => CmpOp::Eq,
+            TokenKind::NotEq => CmpOp::NotEq,
+            TokenKind::Lt => CmpOp::Lt,
+            TokenKind::Gt => CmpOp::Gt,
+            TokenKind::LtEq => CmpOp::LtEq,
+            TokenKind::GtEq => CmpOp::GtEq,
             _ => return Ok(left),
         };
-
+        let s = self.span();
         self.advance();
-        let right = self.parse_addition()?;
-        Ok(Expr::Comparison {
-            left: Box::new(left),
-            op,
-            right: Box::new(right),
-        })
+        let right = self.parse_add()?;
+        Ok(Expr::Cmp(Box::new(left), op, Box::new(right), s))
     }
 
-    fn parse_addition(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_multiplication()?;
+    fn parse_add(&mut self) -> std::result::Result<Expr, Diagnostics> {
+        let mut left = self.parse_mul()?;
         loop {
-            let op = match self.current() {
-                Token::Plus => BinOp::Add,
-                Token::Minus => BinOp::Sub,
+            let (op, s) = match self.kind() {
+                TokenKind::Plus => (BinOp::Add, self.span()),
+                TokenKind::Minus => (BinOp::Sub, self.span()),
                 _ => break,
             };
             self.advance();
-            let right = self.parse_multiplication()?;
-            left = Expr::BinaryOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+            let right = self.parse_mul()?;
+            left = Expr::BinOp(Box::new(left), op, Box::new(right), s);
         }
         Ok(left)
     }
 
-    fn parse_multiplication(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_power()?;
+    fn parse_mul(&mut self) -> std::result::Result<Expr, Diagnostics> {
+        let mut left = self.parse_unary()?;
         loop {
-            let op = match self.current() {
-                Token::Star => BinOp::Mul,
-                Token::Slash => BinOp::Div,
-                Token::Percent => BinOp::Mod,
+            let (op, s) = match self.kind() {
+                TokenKind::Star => (BinOp::Mul, self.span()),
+                TokenKind::Slash => (BinOp::Div, self.span()),
+                TokenKind::Percent => (BinOp::Mod, self.span()),
                 _ => break,
             };
             self.advance();
-            let right = self.parse_power()?;
-            left = Expr::BinaryOp {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+            let right = self.parse_unary()?;
+            left = Expr::BinOp(Box::new(left), op, Box::new(right), s);
         }
         Ok(left)
     }
 
-    fn parse_power(&mut self) -> Result<Expr, String> {
-        let base = self.parse_unary()?;
-        if self.current() == &Token::DoubleStar {
-            self.advance();
-            let exp = self.parse_power()?; // right-associative
-            Ok(Expr::BinaryOp {
-                left: Box::new(base),
-                op: BinOp::Pow,
-                right: Box::new(exp),
-            })
-        } else {
-            Ok(base)
+    fn parse_unary(&mut self) -> std::result::Result<Expr, Diagnostics> {
+        match self.kind() {
+            TokenKind::Minus => {
+                let s = self.span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::UnaryOp(UnaryOp::Neg, Box::new(operand), s))
+            }
+            TokenKind::Not => {
+                let s = self.span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::UnaryOp(UnaryOp::Not, Box::new(operand), s))
+            }
+            TokenKind::Ampersand => {
+                let s = self.span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::UnaryOp(UnaryOp::Ref, Box::new(operand), s))
+            }
+            TokenKind::AmpersandMut => {
+                let s = self.span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::UnaryOp(UnaryOp::MutRef, Box::new(operand), s))
+            }
+            TokenKind::Star => {
+                let s = self.span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::UnaryOp(UnaryOp::Deref, Box::new(operand), s))
+            }
+            TokenKind::Await => {
+                let s = self.span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::Await(Box::new(operand), s))
+            }
+            TokenKind::Spawn => {
+                let s = self.span();
+                self.advance();
+                let operand = self.parse_unary()?;
+                Ok(Expr::Spawn(Box::new(operand), s))
+            }
+            _ => self.parse_postfix(),
         }
     }
 
-    fn parse_unary(&mut self) -> Result<Expr, String> {
-        if self.current() == &Token::Minus {
-            self.advance();
-            let operand = self.parse_unary()?;
-            return Ok(Expr::UnaryOp {
-                op: UnaryOp::Neg,
-                operand: Box::new(operand),
-            });
-        }
-        self.parse_postfix()
-    }
-
-    fn parse_postfix(&mut self) -> Result<Expr, String> {
+    fn parse_postfix(&mut self) -> std::result::Result<Expr, Diagnostics> {
         let mut expr = self.parse_primary()?;
 
         loop {
-            match self.current() {
-                Token::LeftParen => {
+            match self.kind() {
+                TokenKind::LParen => {
+                    let s = self.span();
                     self.advance();
-                    let args = self.parse_arg_list()?;
-                    self.expect(&Token::RightParen)?;
-                    expr = Expr::Call {
-                        callee: Box::new(expr),
-                        args,
-                    };
+                    let mut args = Vec::new();
+                    if !matches!(self.kind(), TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_expr()?);
+                            if matches!(self.kind(), TokenKind::Comma) {
+                                self.advance();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
+                    expr = Expr::Call(Box::new(expr), args, s);
                 }
-                Token::LeftBracket => {
+                TokenKind::Dot => {
+                    let s = self.span();
                     self.advance();
-                    let index = self.parse_expression()?;
-                    self.expect(&Token::RightBracket)?;
-                    expr = Expr::Index {
-                        object: Box::new(expr),
-                        index: Box::new(index),
-                    };
+
+                    if matches!(self.kind(), TokenKind::Dot) {
+                        self.advance();
+                        let end = self.parse_expr()?;
+                        expr = Expr::Range(Box::new(expr), Box::new(end), s);
+                    } else {
+                        let name = self.expect_ident()?;
+                        if matches!(self.kind(), TokenKind::LParen) {
+                            self.advance();
+                            let mut args = Vec::new();
+                            if !matches!(self.kind(), TokenKind::RParen) {
+                                loop {
+                                    args.push(self.parse_expr()?);
+                                    if matches!(self.kind(), TokenKind::Comma) {
+                                        self.advance();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            self.expect(&TokenKind::RParen)?;
+                            expr = Expr::MethodCall(Box::new(expr), name, args, s);
+                        } else {
+                            expr = Expr::Attribute(Box::new(expr), name, s);
+                        }
+                    }
                 }
-                Token::Dot => {
+                TokenKind::LBrack => {
+                    let s = self.span();
                     self.advance();
-                    let name = self.expect_identifier()?;
-                    expr = Expr::Attribute {
-                        object: Box::new(expr),
-                        name,
-                    };
+                    let index = self.parse_expr()?;
+                    self.expect(&TokenKind::RBrack)?;
+                    expr = Expr::Index(Box::new(expr), Box::new(index), s);
+                }
+                TokenKind::Not => {
+                    let s = self.span();
+                    self.advance();
+                    expr = Expr::TryOp(Box::new(expr), s);
                 }
                 _ => break,
             }
@@ -891,183 +790,232 @@ impl Parser {
         Ok(expr)
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, String> {
-        match self.current().clone() {
-            Token::Int(n) => {
+    fn parse_primary(&mut self) -> std::result::Result<Expr, Diagnostics> {
+        match self.kind() {
+            TokenKind::Int(n) => {
+                let n = *n;
+                let s = self.span();
                 self.advance();
-                Ok(Expr::Int(n))
+                Ok(Expr::Literal(Literal::Int(n), s))
             }
-            Token::Float(n) => {
+            TokenKind::Float(n) => {
+                let n = *n;
+                let s = self.span();
                 self.advance();
-                Ok(Expr::Float(n))
+                Ok(Expr::Literal(Literal::Float(n), s))
             }
-            Token::Str(s) => {
+            TokenKind::Str(sval) => {
+                let sval = sval.clone();
+                let s = self.span();
                 self.advance();
-                Ok(Expr::Str(s))
+                Ok(Expr::Literal(Literal::String(sval), s))
             }
-            Token::InterpolatedStr(parts) => {
+            TokenKind::Char(c) => {
+                let c = *c;
+                let s = self.span();
                 self.advance();
-                let mut expr_parts = Vec::new();
-                for part in parts {
-                    match part {
-                        StringPart::Literal(s) => {
-                            expr_parts.push(StringPartExpr::Literal(s));
+                Ok(Expr::Literal(Literal::Char(c), s))
+            }
+            TokenKind::True => {
+                let s = self.span();
+                self.advance();
+                Ok(Expr::Literal(Literal::Bool(true), s))
+            }
+            TokenKind::False => {
+                let s = self.span();
+                self.advance();
+                Ok(Expr::Literal(Literal::Bool(false), s))
+            }
+            TokenKind::Null => {
+                let s = self.span();
+                self.advance();
+                Ok(Expr::Literal(Literal::Null, s))
+            }
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                let s = self.span();
+                self.advance();
+
+                // Generic type instantiation: Foo[T]
+                if matches!(self.kind(), TokenKind::LBrack) && name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    self.advance();
+                    let mut type_args = Vec::new();
+                    loop {
+                        type_args.push(self.parse_type_expr()?);
+                        if matches!(self.kind(), TokenKind::Comma) {
+                            self.advance();
+                        } else {
+                            break;
                         }
-                        StringPart::Expr(tokens) => {
-                            let mut inner_parser = Parser::new(
-                                tokens
-                                    .into_iter()
-                                    .chain(std::iter::once(Token::Eof))
-                                    .collect(),
-                            );
-                            let expr = inner_parser.parse_expression()?;
-                            expr_parts.push(StringPartExpr::Expr(expr));
+                    }
+                    self.expect(&TokenKind::RBrack)?;
+
+                    // Check if it's a struct literal: Foo[T] { ... }
+                    if matches!(self.kind(), TokenKind::LBrace) {
+                        let mut fields = Vec::new();
+                        self.advance();
+                        self.skip_newlines();
+                        while !matches!(self.kind(), TokenKind::RBrace) && !self.at_end() {
+                            let fname = self.expect_ident()?;
+                            self.expect(&TokenKind::Colon)?;
+                            let fval = self.parse_expr()?;
+                            fields.push((fname, fval));
+                            self.skip_newlines();
+                            if matches!(self.kind(), TokenKind::Comma) {
+                                self.advance();
+                                self.skip_newlines();
+                            }
+                        }
+                        self.expect(&TokenKind::RBrace)?;
+                        return Ok(Expr::StructLit(name, fields, s));
+                    }
+
+                    return Ok(Expr::Ident(name, s));
+                }
+
+                // Enum variant: Foo::Bar or Foo(Bar)
+                if matches!(self.kind(), TokenKind::Colon) && matches!(self.tokens.get(self.pos + 1).map(|t| &t.kind), Some(TokenKind::Colon)) {
+                    self.advance(); self.advance(); // skip ::
+                    let variant = self.expect_ident()?;
+                    let args = if matches!(self.kind(), TokenKind::LParen) {
+                        self.advance();
+                        let mut a = Vec::new();
+                        if !matches!(self.kind(), TokenKind::RParen) {
+                            loop {
+                                a.push(self.parse_expr()?);
+                                if matches!(self.kind(), TokenKind::Comma) {
+                                    self.advance();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        self.expect(&TokenKind::RParen)?;
+                        a
+                    } else {
+                        vec![]
+                    };
+                    return Ok(Expr::EnumVariant(name, variant, args, s));
+                }
+
+                // Struct literal: Name { ... }
+                if matches!(self.kind(), TokenKind::LBrace) {
+                    self.advance();
+                    self.skip_newlines();
+                    let mut fields = Vec::new();
+                    while !matches!(self.kind(), TokenKind::RBrace) && !self.at_end() {
+                        let fname = self.expect_ident()?;
+                        self.expect(&TokenKind::Colon)?;
+                        let fval = self.parse_expr()?;
+                        fields.push((fname, fval));
+                        self.skip_newlines();
+                        if matches!(self.kind(), TokenKind::Comma) {
+                            self.advance();
+                            self.skip_newlines();
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace)?;
+                    return Ok(Expr::StructLit(name, fields, s));
+                }
+
+                Ok(Expr::Ident(name, s))
+            }
+            TokenKind::Self_ => {
+                let s = self.span();
+                self.advance();
+                Ok(Expr::Ident("self".into(), s))
+            }
+            TokenKind::LParen => {
+                let s = self.span();
+                self.advance();
+                let mut exprs = Vec::new();
+                exprs.push(self.parse_expr()?);
+                while matches!(self.kind(), TokenKind::Comma) {
+                    self.advance();
+                    exprs.push(self.parse_expr()?);
+                }
+                self.expect(&TokenKind::RParen)?;
+                if exprs.len() == 1 {
+                    Ok(exprs.into_iter().next().unwrap())
+                } else {
+                    Ok(Expr::Tuple(exprs, s))
+                }
+            }
+            TokenKind::LBrack => {
+                let s = self.span();
+                self.advance();
+                let mut items = Vec::new();
+                if !matches!(self.kind(), TokenKind::RBrack) {
+                    loop {
+                        items.push(self.parse_expr()?);
+                        if matches!(self.kind(), TokenKind::Comma) {
+                            self.advance();
+                        } else {
+                            break;
                         }
                     }
                 }
-                Ok(Expr::InterpolatedStr(expr_parts))
+                self.expect(&TokenKind::RBrack)?;
+                Ok(Expr::List(items, s))
             }
-            Token::True => {
-                self.advance();
-                Ok(Expr::Bool(true))
+            TokenKind::LBrace => {
+                let body = self.parse_block()?;
+                let s = self.span();
+                Ok(Expr::Block(body, s))
             }
-            Token::False => {
-                self.advance();
-                Ok(Expr::Bool(false))
+            _ => {
+                let msg = format!("unexpected token {:?}", self.kind());
+                self.diags.push(Diag::error(msg, self.span()));
+                Err(std::mem::take(&mut self.diags))
             }
-            Token::Null => {
-                self.advance();
-                Ok(Expr::Null)
-            }
-            Token::Self_ => {
-                self.advance();
-                Ok(Expr::SelfRef)
-            }
-            Token::Identifier(name) => {
-                self.advance();
-                Ok(Expr::Identifier(name))
-            }
-            Token::LeftParen => {
-                self.advance();
-                let expr = self.parse_expression()?;
-                self.expect(&Token::RightParen)?;
-                Ok(expr)
-            }
-            Token::LeftBracket => self.parse_list_literal(),
-            Token::LeftBrace => self.parse_map_or_set_literal(),
-            _ => Err(format!(
-                "Unexpected token {:?} at position {}",
-                self.current(),
-                self.pos
-            )),
         }
     }
 
-    // --- List literal [a, b, c] ---
-    fn parse_list_literal(&mut self) -> Result<Expr, String> {
-        self.advance(); // skip [
-        let mut items = Vec::new();
-        while self.current() != &Token::RightBracket {
-            items.push(self.parse_expression()?);
-            if self.current() != &Token::Comma {
-                break;
-            }
-            self.advance();
-        }
-        self.expect(&Token::RightBracket)?;
-        Ok(Expr::ListLiteral(items))
-    }
+    // --- Type expressions ---
 
-    // --- Map {k: v, ...} or Set {a, b, ...} ---
-    fn parse_map_or_set_literal(&mut self) -> Result<Expr, String> {
-        self.advance(); // skip {
-        if self.current() == &Token::RightBrace {
-            self.advance();
-            return Ok(Expr::MapLiteral(Vec::new()));
-        }
-
-        let first = self.parse_expression()?;
-
-        // Check if this is a map (key: value) or set
-        if self.current() == &Token::Colon {
-            // Map
-            self.advance();
-            let first_val = self.parse_expression()?;
-            let mut pairs = vec![(first, first_val)];
-            while self.current() == &Token::Comma {
+    fn parse_type_expr(&mut self) -> std::result::Result<TypeExpr, Diagnostics> {
+        let s = self.span();
+        match self.kind() {
+            TokenKind::Ampersand => {
                 self.advance();
-                if self.current() == &Token::RightBrace {
-                    break;
+                let inner = self.parse_type_expr()?;
+                Ok(TypeExpr::Ref(Box::new(inner), s))
+            }
+            TokenKind::AmpersandMut => {
+                self.advance();
+                let inner = self.parse_type_expr()?;
+                Ok(TypeExpr::MutRef(Box::new(inner), s))
+            }
+            TokenKind::Underscore => {
+                self.advance();
+                Ok(TypeExpr::Infer(s))
+            }
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                self.advance();
+
+                if matches!(self.kind(), TokenKind::LBrack) {
+                    self.advance();
+                    let mut args = Vec::new();
+                    loop {
+                        args.push(self.parse_type_expr()?);
+                        if matches!(self.kind(), TokenKind::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RBrack)?;
+                    Ok(TypeExpr::Generic(name, args, s))
+                } else {
+                    Ok(TypeExpr::Named(name, s))
                 }
-                let k = self.parse_expression()?;
-                self.expect(&Token::Colon)?;
-                let v = self.parse_expression()?;
-                pairs.push((k, v));
             }
-            self.expect(&Token::RightBrace)?;
-            Ok(Expr::MapLiteral(pairs))
-        } else {
-            // Set
-            let mut items = vec![first];
-            while self.current() == &Token::Comma {
-                self.advance();
-                if self.current() == &Token::RightBrace {
-                    break;
-                }
-                items.push(self.parse_expression()?);
+            _ => {
+                let msg = format!("expected type, found {:?}", self.kind());
+                self.diags.push(Diag::error(msg, s));
+                Err(std::mem::take(&mut self.diags))
             }
-            self.expect(&Token::RightBrace)?;
-            Ok(Expr::SetLiteral(items))
-        }
-    }
-
-    // --- Argument list for calls ---
-    fn parse_arg_list(&mut self) -> Result<Vec<Expr>, String> {
-        let mut args = Vec::new();
-        if self.current() == &Token::RightParen {
-            return Ok(args);
-        }
-        loop {
-            args.push(self.parse_expression()?);
-            if self.current() != &Token::Comma {
-                break;
-            }
-            self.advance();
-        }
-        Ok(args)
-    }
-
-    // --- Parse indented block ---
-    fn parse_block(&mut self) -> Result<Vec<Stmt>, String> {
-        self.skip_newlines();
-        self.expect(&Token::Indent)?;
-        let mut stmts = Vec::new();
-        self.skip_newlines();
-
-        while !self.is_at_end() && self.current() != &Token::Dedent {
-            stmts.push(self.parse_statement()?);
-            self.skip_newlines();
-        }
-
-        if self.current() == &Token::Dedent {
-            self.advance();
-        }
-
-        Ok(stmts)
-    }
-
-    // --- Expect an identifier token ---
-    fn expect_identifier(&mut self) -> Result<String, String> {
-        match self.current().clone() {
-            Token::Identifier(name) => {
-                self.advance();
-                Ok(name)
-            }
-            _ => Err(format!(
-                "Expected identifier, found {:?} at position {}",
-                self.current(),
-                self.pos
-            )),
         }
     }
 }
